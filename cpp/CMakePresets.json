@@ -1,0 +1,55 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "windows-ninja",
+      "displayName": "Windows x64 - Ninja (default in Visual Studio)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/windows",
+      "architecture": { "value": "x64", "strategy": "external" },
+      "toolset": { "value": "host=x64", "strategy": "external" },
+      "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release", "ONNXRUNTIME_DIR": "$env{ONNXRUNTIME_DIR}", "NGE_WITH_SDL3": "ON" },
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" },
+      "vendor": { "microsoft.com/VisualStudioSettings/CMake/1.0": { "hostOS": [ "Windows" ] } }
+    },
+    {
+      "name": "windows-vs2026",
+      "displayName": "Windows x64 - Visual Studio 2026 solution",
+      "generator": "Visual Studio 18 2026",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/build/vs2026",
+      "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+      "cacheVariables": { "ONNXRUNTIME_DIR": "$env{ONNXRUNTIME_DIR}", "NGE_WITH_SDL3": "ON" },
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" },
+      "vendor": { "microsoft.com/VisualStudioSettings/CMake/1.0": { "hostOS": [ "Windows" ] } }
+    },
+    {
+      "name": "windows-vs2022",
+      "displayName": "Windows x64 - Visual Studio 2022 solution",
+      "inherits": "windows-vs2026",
+      "generator": "Visual Studio 17 2022",
+      "binaryDir": "${sourceDir}/build/vs2022"
+    },
+    {
+      "name": "linux-ninja",
+      "displayName": "Linux - Ninja (headless: server, bot, tests)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/linux",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release", "ONNXRUNTIME_DIR": "$env{ONNXRUNTIME_DIR}", "NGE_WITH_SDL3": "OFF" },
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" },
+      "vendor": { "microsoft.com/VisualStudioSettings/CMake/1.0": { "hostOS": [ "Linux" ] } }
+    }
+  ],
+  "buildPresets": [
+    { "name": "windows-ninja", "configurePreset": "windows-ninja" },
+    { "name": "windows-vs2026", "configurePreset": "windows-vs2026", "configuration": "Release" },
+    { "name": "windows-vs2022", "configurePreset": "windows-vs2022", "configuration": "Release" },
+    { "name": "linux-ninja", "configurePreset": "linux-ninja" }
+  ],
+  "testPresets": [
+    { "name": "windows-ninja", "configurePreset": "windows-ninja", "output": { "outputOnFailure": true } },
+    { "name": "windows-vs2026", "configurePreset": "windows-vs2026", "configuration": "Release", "output": { "outputOnFailure": true } },
+    { "name": "linux-ninja", "configurePreset": "linux-ninja", "output": { "outputOnFailure": true } }
+  ]
+}

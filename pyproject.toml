@@ -1,0 +1,28 @@
+[project]
+name = "neural-game-engine"
+version = "0.1.0"
+description = "Toy neural game engine: GPU world-model server, predicting clients (two-ship space invaders)"
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+readme = "README.md"
+dependencies = [
+    "numpy>=2.0",
+    "torch>=2.4",
+    "pygame>=2.6",
+    "pillow>=12.3.0",
+]
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu124" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[dependency-groups]
+export = [
+    "onnx>=1.23.2",
+    "onnxruntime>=1.31.0",
+]

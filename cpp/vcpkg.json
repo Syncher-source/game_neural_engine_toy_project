@@ -1,0 +1,7 @@
+{
+  "name": "neural-game-engine",
+  "version-string": "0.1.0",
+  "description": "Toy neural game engine: GPU world-model server + predicting SDL3 clients",
+  "builtin-baseline": "e456309491fd875487bf02b8a0dca76c1b1b00cc",
+  "dependencies": [ "sdl3" ]
+}

@@ -1,0 +1,8 @@
+# normalise line endings across Windows / WSL
+* text=auto
+*.sh text eol=lf
+*.pt filter=lfs diff=lfs merge=lfs -text
+*.onnx filter=lfs diff=lfs merge=lfs -text
+*.nge filter=lfs diff=lfs merge=lfs -text
+*.bin binary
+*.png binary

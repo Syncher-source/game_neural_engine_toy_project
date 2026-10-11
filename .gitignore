@@ -1,0 +1,26 @@
+# ---- Python
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+
+# ---- C++ build trees, IDE caches, downloaded SDKs (ONNX Runtime, CUDA/cuDNN redistributables)
+cpp/build/
+cpp/out/
+cpp/.vs/
+cpp/.vscode/
+cpp/CMakeUserPresets.json
+cpp/third_party/
+
+# ---- generated artifacts: everything in checkpoints/ except the trained weights
+checkpoints/*
+!checkpoints/world_model.pt
+!checkpoints/world_model.onnx
+!checkpoints/world_model.nge
+!checkpoints/renderer.pt
+!checkpoints/renderer.onnx
+
+# ---- logs, scratch, OS noise
+*.log
+.DS_Store
+Thumbs.db
