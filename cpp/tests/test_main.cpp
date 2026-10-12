@@ -1,5 +1,6 @@
 // Cross-checks the C++ runtime against the Python reference:
 //   nge_test ../checkpoints/test_vectors.bin [world_model.onnx [renderer_test.bin renderer.onnx [world_model.nge]]]
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <fstream>
@@ -70,27 +71,41 @@ int main(int argc, char** argv) {
   if (argc >= 5) {
     try {
       std::ifstream rf(argv[3], std::ios::binary);
-      int32_t rn, rsd, rh, rw;
-      rf.read((char*)&rn, 4); rf.read((char*)&rsd, 4); rf.read((char*)&rh, 4); rf.read((char*)&rw, 4);
+      int32_t rn, rsd, rfx, rh, rw;
+      rf.read((char*)&rn, 4); rf.read((char*)&rsd, 4); rf.read((char*)&rfx, 4); rf.read((char*)&rh, 4); rf.read((char*)&rw, 4);
       if (!rf) std::printf("neural renderer: SKIPPED (no %s)\n", argv[3]);
-      else if (rsd != L::MODEL_DIM) { std::puts("FAIL renderer vectors header (expected MODEL_DIM rows)"); ++failures; }
+      else if (rsd != L::MODEL_DIM || rfx != L::FX_DIM) { std::puts("FAIL renderer vectors header (expected MODEL_DIM and FX_DIM rows; re-export)"); ++failures; }
       else {
-        // rows are full model vectors whose input slots hold junk: the frames must not depend on them
-        std::vector<ModelVector> rs(rn); std::vector<uint8_t> frames((size_t)rn * rh * rw * 4);
-        rf.read((char*)rs.data(), rn * sizeof(ModelVector)); rf.read((char*)frames.data(), frames.size());
+        // rows are full model vectors whose input slots hold junk (the frames must not depend on
+        // them) plus the renderer's local effects state for that frame; frames were made with dt = 0
+        std::vector<ModelVector> rs(rn); std::vector<float> hs((size_t)rn * L::FX_DIM); std::vector<uint8_t> frames((size_t)rn * rh * rw * 4);
+        rf.read((char*)rs.data(), rn * sizeof(ModelVector)); rf.read((char*)hs.data(), hs.size() * sizeof(float)); rf.read((char*)frames.data(), frames.size());
         NeuralRenderer r(argv[4], false, 1);
         if (r.width() != rw || r.height() != rh) { std::printf("FAIL renderer size %dx%d vs %dx%d\n", r.width(), r.height(), rw, rh); ++failures; }
         else {
-          int bad_px = 0; double ms = 0; int maxd = 0;
+          int bad_px = 0; double ms = 0; int maxd = 0; bool rule_ok = true;
           for (int i = 0; i < rn; ++i) {
-            const auto& f = r.render(rs[i]); ms += r.last_ms();
+            std::vector<float> h0(hs.begin() + (size_t)i * L::FX_DIM, hs.begin() + (size_t)(i + 1) * L::FX_DIM);
+            r.set_fx_state(h0);
+            const auto& f = r.render(rs[i], 0.0f); ms += r.last_ms();
             for (size_t k = 0; k < f.size(); ++k) { int d = std::abs((int)f[k] - (int)frames[(size_t)i * f.size() + k]); maxd = std::max(maxd, d); if (d > 2) ++bad_px; }
             ModelVector z = rs[i]; set_inputs(z, Input{});            // same state, zero inputs -> identical frame
-            const auto f2 = r.render(z);
+            r.set_fx_state(h0);
+            const auto f2 = r.render(z, 0.0f);
             if (f2 != f) { std::puts("FAIL renderer output depends on the input slots"); ++failures; break; }
+            if (r.has_fx()) {                                           // the local state rule: dead slots age by dt, alive ones sit at 0
+              r.set_fx_state(h0); r.render(rs[i], 0.25f);
+              const auto& h1 = r.fx_state();
+              for (int j = 0; j < L::N_INVADERS; ++j) {
+                const bool alive = state_of(rs[i])[L::INV_OFF + j] > 0.5f;
+                const float want = alive ? 0.0f : std::min(h0[(size_t)j * L::FX_STRIDE] + 0.25f, L::FX_DURATION);
+                if (std::fabs(h1[(size_t)j * L::FX_STRIDE] - want) > 1e-5f) rule_ok = false;
+              }
+            }
           }
-          std::printf("neural renderer (%s) %dx%d RGBA8 vs torch: %d/%zu channel values differ by >2/255, max diff %d, %.2f ms/frame%s\n",
-                      r.name(), rw, rh, bad_px, frames.size(), maxd, ms / rn, bad_px > (int)(frames.size() / 1000) ? "  FAIL" : "  ok");
+          if (!rule_ok) { std::puts("FAIL renderer local state rule (h_next ages)"); ++failures; }
+          std::printf("neural renderer (%s%s) %dx%d RGBA8 vs torch: %d/%zu channel values differ by >2/255, max diff %d, %.2f ms/frame%s\n",
+                      r.name(), r.has_fx() ? ", local effects state" : "", rw, rh, bad_px, frames.size(), maxd, ms / rn, bad_px > (int)(frames.size() / 1000) ? "  FAIL" : "  ok");
           failures += bad_px > (int)(frames.size() / 1000);
         }
       }

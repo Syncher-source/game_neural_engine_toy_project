@@ -4,6 +4,7 @@
 
 Produces
   checkpoints/world_model.onnx     full next-state graph (post-processing baked in)
+  checkpoints/renderer.onnx        renderer graph (x, h, dt) -> (image RGBA8, h_next), see ExportRenderer
   checkpoints/test_vectors.bin     (state, input, classic_next, neural_next) rows for
                                    the C++ cross-check test
   cpp/include/nge/layout.h         state layout + physics constants as C++ constexprs
@@ -27,6 +28,7 @@ from . import config as C
 from . import sim
 from . import state as S
 from .model import load_model, WorldModel, N_BUL, FORM_DIR_IDX
+from . import renderer as R
 
 
 class ExportModel(nn.Module):
@@ -90,6 +92,9 @@ def write_layout_header(path: Path):
         f"inline constexpr int INPUT_STRIDE = {S.INPUT_STRIDE};",
         f"inline constexpr int INPUT_DIM = {S.INPUT_DIM};",
         f"inline constexpr int MODEL_DIM = {S.MODEL_DIM};   // [state | inputs]: the single vector a model receives",
+        f"inline constexpr int FX_STRIDE = {R.FX_STRIDE};   // renderer-local effects state: per invader slot [age, cx, cy]",
+        f"inline constexpr int FX_DIM = {R.FX_DIM};",
+        f"inline constexpr float FX_DURATION = {flit(R.FX_DURATION)};   // idle state: every age at FX_DURATION",
         f"inline constexpr int N_CONT = {S.N_CONT};",
         f"inline constexpr int N_BIN = {S.N_BIN};",
         arr("CONT_IDX", S.CONT_IDX.tolist()), arr("BIN_IDX", S.BIN_IDX.tolist()),
@@ -156,7 +161,8 @@ def main():
     print(f"saved {det_path} ({export_det(m, det_path) / 1e6:.1f} MB, raw weights for the deterministic C++ kernel)")
 
     if args.renderer and Path(args.renderer).exists():
-        export_renderer(args.renderer, args.renderer_onnx, args.renderer_vectors, st[:8], args.render_res)
+        # test frames: 4 match starts and 4 random states (dead slots, so explosions in flight get exercised)
+        export_renderer(args.renderer, args.renderer_onnx, args.renderer_vectors, np.concatenate([st[:4], st[-4:]]), args.render_res)
     elif args.renderer:
         print(f"renderer checkpoint {args.renderer} not found, skipping (train with python -m nge.train_renderer)")
 
@@ -166,24 +172,33 @@ class ExportRenderer(nn.Module):
 
     Doing the float -> byte conversion inside the graph means the C++ client can hand the
     output buffer straight to a GPU texture (no CUDA kernel of its own, no CPU readback).
+
+    Graph contract (same for every renderer, with or without learned effects):
+        inputs   x (1, MODEL_DIM)   h (1, FX_DIM) local effects state   dt (1,) frame time, seconds
+        outputs  image (1, H, W, 4) uint8   h_next (1, FX_DIM)
+    `h` never leaves the renderer: the client loops h_next back into h every frame and starts
+    from the idle state (every age = FX_DURATION). The state update is the fixed rule in
+    renderer.step_fx (part of the graph); drawing from it is what the network learned.
     """
 
     def __init__(self, r):
         super().__init__()
         self.r = r
 
-    def forward(self, x):
+    def forward(self, x, h, dt):
         """x: (B, MODEL_DIM). Only the state part is read; the input slots are sliced away, so
         whatever they contain cannot influence the frame."""
+        from .renderer import step_fx
         state = x[:, : S.STATE_DIM]
-        img = self.r(state)                                        # (B, H, W, 3) in [0, 1]
+        h_next = step_fx(state, h, dt)
+        img = self.r(state, h=h_next)                              # (B, H, W, 3) in [0, 1]
         alpha = torch.ones_like(img[..., :1])
         rgba = torch.cat([img, alpha], dim=-1) * 255.0 + 0.5
-        return torch.clamp(torch.floor(rgba), 0.0, 255.0).to(torch.uint8)
+        return torch.clamp(torch.floor(rgba), 0.0, 255.0).to(torch.uint8), h_next
 
 
 def export_renderer(ckpt: str, onnx_path: str, vectors_path: str, states: np.ndarray, res: int) -> None:
-    from .renderer import load_renderer
+    from .renderer import load_renderer, fx_idle, FX_DIM, FX_DURATION
     r = load_renderer(ckpt, "cpu")
     if res:
         r = r.at_resolution(res, res)
@@ -191,14 +206,26 @@ def export_renderer(ckpt: str, onnx_path: str, vectors_path: str, states: np.nda
     rng = np.random.default_rng(7)
     junk = rng.uniform(-1, 1, (len(states), S.INPUT_DIM)).astype(np.float32)      # arbitrary input slots
     xs = S.pack(states, junk)
+    xt = torch.as_tensor(xs)
+    # local states: half idle, half with explosions in flight at dead slots (random ages, centres)
+    hs = fx_idle(xt[:, : S.STATE_DIM]).numpy()
+    dead = states[:, S.INV_OFF:] <= 0.5
+    boom = dead & (rng.random(dead.shape) < 0.5); boom[: len(states) // 2] = False
+    hs[:, 0::3] = np.where(boom, rng.uniform(0, FX_DURATION, boom.shape), hs[:, 0::3])
+    hs[:, 1::3] = np.where(boom, hs[:, 1::3] + rng.uniform(-0.08, 0.08, boom.shape), hs[:, 1::3]).astype(np.float32)
+    dts = np.zeros((len(states), 1), dtype=np.float32)                          # dt 0: the frame is a function of (x, h) alone
+    ht = torch.as_tensor(hs)
     with torch.no_grad():
-        ref = er(torch.as_tensor(xs)).numpy()
-        ref_zero = er(torch.as_tensor(S.pack(states, np.zeros_like(junk)))).numpy()
+        ref, ref_h = (t.numpy() for t in er(xt, ht, torch.as_tensor(dts)))
+        ref_zero, _ = (t.numpy() for t in er(torch.as_tensor(S.pack(states, np.zeros_like(junk))), ht, torch.as_tensor(dts)))
     assert np.array_equal(ref, ref_zero), "renderer must ignore the input slots"
+    if r.fx:
+        idle, _ = (t.numpy() for t in er(xt, torch.as_tensor(fx_idle(xt[:, : S.STATE_DIM])), torch.as_tensor(dts)))
+        assert not np.array_equal(ref[len(states) // 2:], idle[len(states) // 2:]), "explosions in h must change the frame"
     # Static batch of 1: the client renders one frame per tick, and a fixed shape lets the
     # exporter constant-fold the broadcast/shape logic so every node runs on the GPU provider.
-    torch.onnx.export(er, (torch.as_tensor(xs[:1]),), onnx_path, opset_version=17, input_names=["x"], output_names=["image"],
-                      do_constant_folding=True, dynamo=False)
+    torch.onnx.export(er, (xt[:1], ht[:1], torch.as_tensor(dts[:1, 0])), onnx_path, opset_version=17,
+                      input_names=["x", "h", "dt"], output_names=["image", "h_next"], do_constant_folding=True, dynamo=False)
     import onnx
     m = onnx.load(onnx_path)
     dims = m.graph.output[0].type.tensor_type.shape.dim
@@ -206,18 +233,25 @@ def export_renderer(ckpt: str, onnx_path: str, vectors_path: str, states: np.nda
         d.ClearField("dim_param"); d.dim_value = v
     onnx.save(m, onnx_path)
     shape_ops = sorted({n.op_type for n in m.graph.node if n.op_type in ("Shape", "ConstantOfShape", "Expand", "Where", "Equal", "Gather", "Reshape")})
-    print(f"renderer graph: {len(m.graph.node)} nodes, shape-related ops left: {shape_ops or 'none'}")
+    print(f"renderer graph: {len(m.graph.node)} nodes, fx features {r.fx}, shape-related ops left: {shape_ops or 'none'}")
     import onnxruntime as ort
     sess = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
-    out = np.concatenate([sess.run(["image"], {"x": xs[i:i + 1]})[0] for i in range(len(states))])
+    outs = [sess.run(["image", "h_next"], {"x": xs[i:i + 1], "h": hs[i:i + 1], "dt": dts[i]}) for i in range(len(states))]
+    out = np.concatenate([o[0] for o in outs]); out_h = np.concatenate([o[1] for o in outs])
     assert out.dtype == np.uint8 and out.shape[-1] == 4, out.shape
+    assert np.abs(out_h - ref_h).max() < 1e-6, "h_next differs between onnxruntime and torch"
+    # the state rule, exercised through the graph: a dead slot ages by dt, an alive one stays at 0 / follows its slot
+    h2 = sess.run(["h_next"], {"x": xs[:1], "h": hs[:1], "dt": np.array([0.25], np.float32)})[0]
+    exp_age = np.where(dead[0], np.minimum(hs[0, 0::3] + 0.25, FX_DURATION), 0.0)
+    assert np.abs(h2[0, 0::3] - exp_age).max() < 1e-6, "h_next ages wrong"
     diff = np.abs(out.astype(np.int16) - ref.astype(np.int16))
     print(f"renderer {r.H}x{r.W} RGBA8: onnxruntime vs torch max diff {diff.max()} (values off by >1: {(diff > 1).sum()})   saved {onnx_path}")
-    with open(vectors_path, "wb") as f:     # rows are full model vectors with junk in the input slots
-        f.write(struct.pack("<4i", len(states), S.MODEL_DIM, r.H, r.W))
+    with open(vectors_path, "wb") as f:     # rows are full model vectors with junk in the input slots, plus the local state rows
+        f.write(struct.pack("<5i", len(states), S.MODEL_DIM, FX_DIM, r.H, r.W))
         f.write(np.ascontiguousarray(xs, dtype="<f4").tobytes())
+        f.write(np.ascontiguousarray(hs, dtype="<f4").tobytes())
         f.write(np.ascontiguousarray(out).tobytes())
-    print(f"saved {vectors_path} ({len(states)} RGBA frames)")
+    print(f"saved {vectors_path} ({len(states)} RGBA frames, with local effects states)")
 
 
 if __name__ == "__main__":

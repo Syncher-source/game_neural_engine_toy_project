@@ -101,6 +101,105 @@ rows hash `edadd50658a76fda`. `--sim det` is now the default; `--sim onnx` keeps
   fire & cooldown), which would attack the largest remaining rate (spawn without fire 75/1000);
   a rule-violation penalty inside the fine-tuning loss (differentiable surrogates).
 
+## State extension: decided against a wire latent, for renderer-local state (2026-10-12)
+
+* The 49-slot explicit state stays the only wire format and the only thing the world model
+  advances. A learned latent appended to the protocol was discussed (hybrid: explicit core +
+  latent block) and rejected by the user: the network interface must stay clean for debugging
+  and bandwidth, and a shared latent space is hard to keep stable across model versions.
+* Instead, physics nobody needs to synchronise lives in the renderer, locally: explosions,
+  trails, flashes, particles. Design sketch (not started):
+  - renderer becomes recurrent: `(state, hidden_prev, dt) -> (frame, hidden)`; hidden state is
+    local, never on the wire, needs no determinism, may be fp16; spatial (low-res feature map)
+    rather than a vector so particles have positions to live in;
+  - effects are triggered by *observed* transitions between rendered frames (alive 1->0,
+    bullet active 1->0), so the world model and the protocol are untouched;
+  - runs at frame rate, not tick rate; rewind/replay never feeds the renderer, only the final
+    predicted state per frame, so replays cannot re-fire effects; mispredicted kills produce a
+    visual-only ghost explosion (acceptable; alternative: drive effects from the authoritative
+    stream, one RTT late);
+  - training: particle system added to the teacher rasterizer (`raster_sprites.py`), renderer
+    trained on short sequences with the recurrence unrolled; keep heavy weight on current-state
+    object pixels and a narrow recurrent channel so the recurrence cannot lag ship positions.
+
+### Teacher particle system (2026-10-12, done, look pending user approval)
+
+* `nge/effects.py`: `Effects(B, device)` holds up to 8 explosions per world as (centre, age,
+  row, seed); `observe(prev, cur)` spawns one per invader alive in `prev` and dead in `cur`, at
+  its `prev` position; `advance(dt)`; `render(X, Y, px)` -> premultiplied RGBA layer. Every
+  particle is analytic in the age (drag: `v tau (1 - exp(-t/tau))`), so frame rate does not
+  change the look and there is no integration state. 0.7 s per explosion: flash (150 ms),
+  shock ring (350 ms, radius ~0.06 = one invader), 18 sparks (streaks, per-spark lifetime and
+  flicker, hot white -> row colour), 5 debris chunks of the row's material (shrink after
+  0.35 s). Per-row palette: green/silver, copper, gold-red/dark steel.
+* `raster_sprites.rasterize(s, H, W, window, fx=None)` now returns `(rgb, obj_a, laser_a, fx_a)`;
+  the effects layer is composited after lasers and before ships. Without `fx` the output is
+  bit-identical to before (checked against the committed version, full frame and crops).
+* Cost (RTX 4090): 720 full frame B=16 with 3 explosions 65 ms/batch; 32 crops of 160 px with 2
+  explosions each 100 ms/batch (mostly per-crop Python overhead, same as today's trainer).
+* `python -m nge.effects` writes `assets/sprites/explosion_sheet.png` (3 rows x 10 frames,
+  50 ms apart), `explosion_frame.png` (720, from a scripted kill rollout) and `explosion.gif`
+  (360 px, 60 fps, 30 Hz sim: effects spawn from observed transitions only).
+* Known limits: the last invader of a wave never explodes (the sim respawns the wave in the
+  same tick, so no 1 -> 0 transition is observable: consistent with what the renderer sees);
+  `_sub(fx, b)` views one world of a batch for per-crop rendering; the trainer does not use
+  effects yet (unpacks and ignores `fx_a`).
+
+### Renderer with local effects state (2026-10-12, done, look soft)
+
+* Design chosen over a generic spatial recurrent hidden state: `h` = per invader slot
+  [age since last alive, cx, cy] (FX_DIM = 54), updated by a fixed rule in the graph
+  (`renderer.step_fx`: alive -> age 0 and centre follows the slot; dead -> age += dt saturating
+  at 0.7 s, centre frozen). Reasons: exact, debuggable, no sequence training (sample (state, h)
+  pairs directly and let the teacher draw from the same h via `Effects.from_local`), and the
+  frozen centre keeps the explosion where the kill happened while the formation moves on.
+  The teacher's particle seed is fixed (FX_SEED) so the target is a deterministic function of
+  (state, h); per-slot variety could later come from a per-slot rotation of the relative coords.
+* Network, attempt 1: +18 "objects" (slot centres from h) with the bullets' rel-coord Fourier
+  features and 5 age features per slot (360 channels, 653k params, 23 ms/frame). 8000 steps
+  lr 1e-4: explosion px 0.275 but visually only a faint average blob, no ring/sparks. Cause: no
+  weight sharing across slots, each slot's explosion learned from 1/18 of the data.
+* Network, attempt 2 (current): per pixel, argmax over slots of life x in-reach picks the one
+  exploding slot; gather its rel coords (FX_SCALE 0.06, clamp +-2 = +-0.12 world), Fourier
+  features, radial distance and 7 age features (life, sin/cos at 1, 2, 4 cycles), all
+  multiplied by an in-reach mask. 22 extra channels, 567k params, 20 ms/frame fp32. ArgMax +
+  GatherElements export fine (ORT CPU verified via nge_test). Old checkpoints load with the
+  new channels zero-initialised (`grow_first_layer`), bit-for-bit the old behaviour.
+  Result after 8000 steps: explosion px 0.39, PSNR 35.6, but visually still only a swelling,
+  fading blob: no ring, no sparks, no row colour. Cause: a spark is ~0.14 clamped units wide,
+  8x finer than the finest rel-coord Fourier feature (period 1 unit); nothing to build it from.
+* Attempt 3 (current): same selection, plus a polar basis for the chosen explosion: cos/sin of
+  k x angle for k = 1..16 (angle-addition recurrence from rx/r, ry/r: no atan2 in ONNX) and
+  radial sin/cos at 0.5..8 cycles per unit (period down to 5 px at 720). Sparks are radial
+  streaks and the ring a circle, both separable in these. 64 extra channels, 578k params,
+  24 ms/frame fp32. Export + nge_test verified on the smoke checkpoint.
+  Result (8000 steps from `renderer.pt`, `renderer_fx_run3.pt`): explosion px 0.457, PSNR
+  36.1, objects 0.946, lasers 0.808. Visually the first real explosion: ring, radial spark
+  pattern, row colour, correct place and time in the rollout, but blurred/low-order, and a
+  faint square box around each explosion: the hard square in-reach mask (|rx|,|ry| < 2) made
+  the features discontinuous and the 3x3 convs spread the step.
+* Attempt 4 (shipped as `checkpoints/renderer.pt`; the sprite-only one kept locally as
+  `renderer_nofx.pt`): circular reach (FX_REACH 2.2) with a soft edge over the last 0.4 units
+  multiplying every explosion feature, so they go to zero continuously. 12000 more steps from
+  `renderer_fx_run3.pt`, lr 1e-4, fx weight 15, p_slot 0.3. Result: explosion px 0.552, PSNR
+  37.5, objects 0.958, lasers 0.846 (both above the sprite-only 0.96 / 0.78). Visually: flash,
+  ring in the row colour, radial spark star, fade, right place and time; still soft, sparks not
+  resolved individually, faint concentric texture (the radial Fourier features showing through).
+  The box artifact is gone. Exported `renderer.onnx` (720) and `renderer_480.onnx`, vectors with
+  4 match starts + 4 random states; nge_test: 0 pixels differ at both sizes.
+* Where to go next if the look matters: (a) the laser lesson again: a fatter spark in the
+  teacher (rs 0.0042 -> ~0.007, maybe 12 sparks) would be learnable at this resolution (the
+  user approved the current look, so this is their call); (b) longer training / a wider first
+  layer; (c) per-slot rotation of the polar angle for variety, free once the pattern is learned.
+* Export contract for every renderer graph, old or new: inputs x, h, dt; outputs image,
+  h_next. `renderer_test.bin` gained FX_DIM in the header and the h rows. C++ `NeuralRenderer`
+  keeps h, feeds dt, loops h_next (readback and IO-binding paths; h_next bound to a host
+  buffer), `reset_fx()` after the warm-up frames; `nge_test` also checks the ageing rule through
+  the graph. Verified in WSL (ORT CPU) against both the old and a fx checkpoint: 0 pixels differ.
+* Training: lr 3e-4 one-cycle, fx weight 25, p_slot 0.3 gave unreadable metrics (obj/PSNR
+  included explosion pixels); metrics now exclude explosion px from the object score. Runs:
+  attempt 1 above; attempt 2: lr 1e-4, fx weight 10, p_slot 0.25, 8000 steps from `renderer.pt`.
+
 ## Parked
 
 * Client: no error threshold before replay; no jitter buffer / interpolation for the remote

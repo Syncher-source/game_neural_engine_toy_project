@@ -1,6 +1,10 @@
 """Batched GPU sprite compositor (torch): the 1950s look, ground truth for the neural renderer.
 
-    rasterize(state, H, W, window=None) -> rgb (B, h, w, 3), obj_alpha (B, h, w), laser_alpha (B, h, w)
+    rasterize(state, H, W, window=None, fx=None)
+        -> rgb (B, h, w, 3), obj_alpha (B, h, w), laser_alpha (B, h, w), fx_alpha (B, h, w)
+
+`fx` is an optional `effects.Effects` (local explosions, not game state) composited between the
+world and the ships; without it fx_alpha is all zeros and the frame is a pure function of the state.
 
 Sprites come from `nge.sprites` (generated once per process, premultiplied RGBA textures) and
 are placed with bilinear sampling, so the output is correct at any resolution and for any
@@ -70,7 +74,7 @@ def _over(dst, src):
 
 
 @torch.no_grad()
-def rasterize(s: torch.Tensor, H: int, W: int, window=None):
+def rasterize(s: torch.Tensor, H: int, W: int, window=None, fx=None):
     B, dev = s.shape[0], s.device
     sp = sprites(dev)
     X, Y = grid(H, W, dev, window)
@@ -94,21 +98,33 @@ def rasterize(s: torch.Tensor, H: int, W: int, window=None):
         lay = _layer(sp["laser"][p], X, Y, cx, cy, LASER_HALF, act)
         for b in range(C.N_BULLETS):
             out = _over(out, lay[:, b]); laser_a = torch.maximum(laser_a, lay[:, b, 3])
+    # local effects (explosions where invaders were): above the world, below the ships
+    fx_a = torch.zeros(B, h, w, device=dev)
+    if fx is not None:
+        layer = fx.render(X, Y, 1.0 / H)
+        out = _over(out, layer); fx_a = layer[:, 3]
     for p in range(C.N_PLAYERS):
         cx = s[:, S.ship_idx(p, 0):S.ship_idx(p, 0) + 1]; cy = s[:, S.ship_idx(p, 1):S.ship_idx(p, 1) + 1]
         out = _over(out, _layer(sp["ship"][p], X, Y, cx, cy, SHIP_HALF, torch.ones_like(cx))[:, 0])
     rgb = out[:, :3].permute(0, 2, 3, 1).clamp(0, 1)
     bg = torch.tensor(BG, device=dev)
     obj_a = ((rgb - bg).abs().sum(-1) > 2e-3).float()
-    return rgb, obj_a, laser_a
+    return rgb, obj_a, laser_a, fx_a
 
 
-def object_centres(s: torch.Tensor):
+def object_centres(s: torch.Tensor, h: torch.Tensor | None = None):
     """(B, N, 2) world positions of every object slot and (B, N) sampling weights for crop
     selection: invisible slots (dead invaders, inactive lasers) get 0, active lasers are
-    up-weighted because they are the smallest and rarest thing on screen."""
+    up-weighted because they are the smallest and rarest thing on screen. With the renderer's
+    local state `h`, explosions in flight are added as objects (weight 4)."""
     form = s[:, S.FORM_OFF:S.FORM_OFF + 2]
     pts, wts = [], []
+    if h is not None:
+        from . import renderer as R
+        hh = h.reshape(s.shape[0], C.N_INVADERS, R.FX_STRIDE)
+        dead = (s[:, S.INV_OFF:S.STATE_DIM] <= 0.5).float()
+        for i in range(C.N_INVADERS):
+            pts.append(hh[:, i, 1:3]); wts.append((hh[:, i, 0] < R.FX_DURATION).float() * dead[:, i] * 4.0)
     for i in range(C.N_INVADERS):
         row, col = divmod(i, C.INV_COLS)
         pts.append(torch.stack([C.INV_X0 + form[:, 0] + col * C.INV_DX, C.INV_Y0 + form[:, 1] + row * C.INV_DY], -1))

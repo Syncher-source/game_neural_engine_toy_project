@@ -60,6 +60,8 @@ nge/                 Python package
   data.py train.py   data generation with mixed input policies; training loop
   evaluate.py        neural vs classic rollout drift report
   raster.py          batched GPU rasterizer of the classic look (ground truth for the renderer)
+  sprites.py raster_sprites.py   procedural 1950s sprites and their GPU compositor (ground truth)
+  effects.py         local explosion particles for the teacher (not game state, never on the wire)
   renderer.py train_renderer.py   neural renderer (state -> RGB) and its training
   export_onnx.py     -> checkpoints/world_model.onnx, test vectors, cpp/include/nge/layout.h
   protocol.py        packet encode/decode      netsim.py   packet loss / latency simulator
@@ -82,11 +84,14 @@ checkpoints/         world_model.{pt,onnx}, renderer.{pt,onnx}, test vectors, re
   it every tick and steps it. A client does the same with `[its local world state, i.e. the
   last network state plus its own prediction | its local input, the last remote input the
   server reported]`.
-* Renderer: `x -> image`. It takes the same vector and ignores the input slots by construction
-  (they are sliced off inside the graph), so it knows nothing about how the state was produced.
-  The cross-check test feeds junk in those slots and requires identical frames.
+* Renderer: `(x, h, dt) -> (image, h_next)`. It takes the same vector and ignores the input
+  slots by construction (they are sliced off inside the graph), so it knows nothing about how
+  the state was produced. The cross-check test feeds junk in those slots and requires identical
+  frames. `h` is the renderer's own *local* state (54 floats: per invader slot, seconds since it
+  was last alive and where it was), advanced with the frame time `dt`; it holds the explosions
+  and never goes over the wire, see "Local effects" below.
 
-Enforced at every level: ONNX inputs/outputs `x`, `x_next`, `image`; C++ `ModelVector` with
+Enforced at every level: ONNX inputs/outputs `x`, `x_next`, `image`, `h`, `h_next`; C++ `ModelVector` with
 `pack()`, `set_inputs()`, `state_of()` and `inputs_consumed()` (`cpp/include/nge/state.h`);
 Python `WorldModel.predict(x) -> x_next`.
 
@@ -185,6 +190,50 @@ supersampled and filtered, so it is re-colourable and resolution independent
 the sprites for a batch of states on the GPU with bilinear sampling, for the full frame or for
 any pixel window.
 
+**Local effects.** `nge/effects.py` adds explosions where invaders die: a hot flash, a shock
+ring, sparks in the row's colour and a few debris chunks of its material, drawn by the same
+compositor between the world and the ships (`assets/sprites/explosion_sheet.png`,
+`explosion_frame.png`, `explosion.gif`). They are deliberately *not* game state: an explosion
+is spawned when two consecutive rendered states show an alive flag going from 1 to 0, it lives
+only on the machine that draws it, and it advances with frame time rather than with the
+30 Hz tick (every particle is an analytic function of the explosion's age, so no integration
+state exists). Nothing of it is simulated by the world model or sent over the wire.
+
+The renderer network reproduces them from a local state of its own, `h`: one record per
+invader slot, [seconds since the slot was last alive, x, y of the slot when it was last
+alive]. The update is a fixed rule inside the graph (`renderer.step_fx`: an alive slot sits at
+age 0 and follows the formation, a dead one ages with the frame time and keeps its centre),
+of the same kind as the clamps the world-model graph carries; what the network learns is the
+drawing: from (state, h) to the flash, ring, sparks and debris the teacher would draw. Each
+pixel picks the one exploding slot within reach and receives its offset from that slot's
+remembered centre (with the same Fourier expansion the bullets use) plus that slot's age
+features, all zero when no explosion is near: one shared feature set, so the explosion is
+learned once rather than once per slot (a first attempt with per-slot channels learned only
+the average blob).
+Training needs no sequences: because the rule is exact, (state, h) pairs are sampled directly
+(`train_renderer.sample_fx`) and the teacher draws the matching explosions from the same `h`
+(`Effects.from_local`), so the renderer is fine-tuned exactly like before, on crops.
+On a client `h` lives in the renderer object only: the C++ `NeuralRenderer` and the Python
+`RendererRuntime` loop `h_next` back into `h` every frame with the measured frame time, and
+rewind/replay never touch it. `python -m nge.effects --student checkpoints/renderer.pt`
+writes the teacher-vs-network comparison (`assets/sprites/explosion_student_sheet.png`, teacher
+and network rows per invader type, and a side-by-side GIF).
+
+What it took to learn them, each step found from the failure it fixed: per-slot feature
+channels learned only the average blob (no weight sharing across the 18 slots), so every pixel
+now selects the one exploding slot in reach and gets a single shared feature set; the sparks
+are far finer than the relative-coordinate Fourier features, so the pixel also gets a polar
+basis, angle harmonics up to 16 and radial frequencies up to 8 cycles per unit, in which
+streaks and rings are separable; and a hard square reach mask showed through as a box around
+each explosion, so the reach is circular with a soft edge. Result of the shipped checkpoint
+(fine-tuned from the sprite renderer, 20k steps): 37.5 dB PSNR on frames with explosions,
+96% of sprite pixels and 85% of laser pixels within 0.1 of the target (both a little better
+than before), 55% of explosion pixels. The network draws the flash, the ring in the row's
+colour, a radial star of sparks and the fade, at the right place and time, but soft: the
+individual spark streaks are not resolved and a faint concentric texture remains around the
+explosion. The frame costs about 24 ms in fp32 (torch, RTX 4090, from 19 ms) for 16k extra
+parameters.
+
 **Training** (`python -m nge.train_renderer`): states come from a pool simulated by the
 classic reference sim plus random states; targets are composited on the fly, so data is
 unlimited. At 720x720 a full frame is too large to backpropagate through in batches, so each
@@ -206,8 +255,9 @@ to matter at this resolution, each found from the failure it fixes:
   "right row" and "right column" were separate cues that added up. A radial-distance channel
   per object removes it.
 
-Result: 41.7 dB PSNR against the compositor, 96% of object pixels and 78% of laser pixels
-within 0.1 of the target (`checkpoints/renderer_preview.png`). The export writes
+Result of the sprite-only renderer: 41.7 dB PSNR against the compositor, 96% of object pixels
+and 78% of laser pixels within 0.1 of the target (`checkpoints/renderer_preview.png`); the
+shipped checkpoint adds the local explosions (see "Local effects"). The export writes
 `renderer.onnx` with the float-to-RGBA8 conversion baked into the graph, so the network's
 output is directly a displayable frame; the renderer ignores the input slots of the model
 vector by construction. Frame time of the 560k-parameter network at 720x720 on an RTX 4090:
@@ -228,6 +278,7 @@ uv sync                                   # torch (CUDA 12.4), pygame, numpy
 uv run python -m nge.train --samples 8000000 --epochs 40 --hidden 768   # or use the shipped checkpoint
 uv run python -m nge.evaluate
 uv run python -m nge.train_renderer       # renderer network (~10 min), or use the shipped checkpoint
+uv run python -m nge.train_renderer --fx --init checkpoints/renderer.pt --lr 1e-4 --steps 8000   # + local explosions (fine-tune)
 uv run python -m nge.export_onnx          # ONNX (world model + renderer) + test vectors + C++ header
 
 uv run python -m nge.server                                   # GPU world model, UDP 9999
@@ -401,11 +452,12 @@ design of the deterministic world-model kernel.
   shared D3D12 *buffer* and let D3D12 copy buffer to texture) to drop the one remaining
   device-to-device copy; add a Vulkan variant of the interop for Linux.
 * Renderer: fp16 export for the 720 renderer if the budget gets tight; a 16:9 window with the
-  HUD beside the square world; explosions / trails (the renderer would need the previous
-  frame or a state extension); a diffusion/latent decoder once the state becomes a latent.
+  HUD beside the square world; more local effects on the same mechanism (ship hit flashes,
+  engine trails: each is a few more slots in `h`), and variety per explosion (a per-slot
+  rotation of the relative coordinates would give every slot its own spark pattern for free).
 * Train on the model's own rollouts (closed-loop fine-tuning) to shrink long-horizon drift.
-* Sequence or latent state instead of a hand-designed vector, so the "game design" lives in
-  the data rather than in `state.py`.
+* Not planned: a learned latent on the wire. The explicit 49-slot state stays the protocol;
+  anything that need not be synchronised (effects) lives locally in the renderer, as above.
 
 ## License
 

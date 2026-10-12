@@ -121,6 +121,8 @@ int main(int argc, char** argv) {
   uint64_t skipped_renders = 0, catchup_ticks = 0, n_loops = 0;
   Uint64 last_log = SDL_GetTicksNS(), loop_start = SDL_GetTicksNS();
   SDL_Texture* last_tex = nullptr;
+  Uint64 last_render_ns = 0;
+  nrend->reset_fx();                        // the warm-up frames above must not leave effects behind
   auto ema = [](double& e, double v) { e = e == 0 ? v : e * 0.9 + v * 0.1; };
   while (running) {
     const Uint64 loop_t0 = SDL_GetTicksNS();
@@ -184,13 +186,16 @@ int main(int argc, char** argv) {
       if (behind && last_tex) { tex = last_tex; ++skipped_renders; }          // keep the previous frame, stay on schedule
       else {
         const Uint64 t0 = SDL_GetTicksNS();
+        // frame time for the renderer's local effects (explosions run on wall-clock time, not ticks)
+        const float fdt = last_render_ns ? std::min((float)((t0 - last_render_ns) / 1e9), 0.1f) : 0.0f;
+        last_render_ns = t0;
         if (interop) {
           interop->begin_frame();
-          const void* dev = nrend->render_gpu(rs);
+          const void* dev = nrend->render_gpu(rs, fdt);
           if (dev) { interop->submit(dev, (size_t)nrend->width() * 4); tex = interop->texture(); }
         }
         if (!tex) {
-          const auto& px = nrend->render(rs);
+          const auto& px = nrend->render(rs, fdt);
           if (!frame_tex) { frame_tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING, nrend->width(), nrend->height()); SDL_SetTextureScaleMode(frame_tex, SDL_SCALEMODE_NEAREST); }
           SDL_UpdateTexture(frame_tex, nullptr, px.data(), nrend->width() * 4);
           tex = frame_tex;
