@@ -17,12 +17,29 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from . import config as C
 from . import state as S
 
 CONT_IDX_T = torch.as_tensor(S.CONT_IDX, dtype=torch.long)
 BIN_IDX_T = torch.as_tensor(S.BIN_IDX, dtype=torch.long)
 BUL_ACT_T = torch.as_tensor(S.BUL_ACT_IDX, dtype=torch.long)
 BUL_POS_T = torch.as_tensor(S.BUL_POS_IDX.reshape(-1, 2), dtype=torch.long)   # (6, 2) -> x,y per bullet
+
+
+# ---- structured event head ------------------------------------------------------------------
+# Discrete events are not independent flags: a bullet picks at most one target. The head outputs
+#   act   [N_BUL]              logit: bullet slot active next tick (before hit consumption)
+#   dir   [1]                  logit: formation moving right
+#   reset [1]                  logit: wave cleared -> respawn everything
+#   hit   [N_BUL, N_INV + 1]   per bullet, a choice over "which invader did I hit" / "none"
+# and the next alive flags are *derived*: alive' = reset ? 1 : alive & ~killed, with killed the
+# union of the chosen targets of the active bullets. One bullet, one kill, by construction.
+N_BUL = C.N_PLAYERS * C.N_BULLETS
+N_HIT = C.N_INVADERS + 1
+HEAD_ACT, HEAD_DIR, HEAD_RESET, HEAD_HIT = 0, N_BUL, N_BUL + 1, N_BUL + 2
+N_LOGITS = N_BUL + 2 + N_BUL * N_HIT
+FORM_DIR_IDX = S.FORM_OFF + 2
+MODEL_VERSION = 2
 
 
 class WorldModel(nn.Module):
@@ -35,7 +52,7 @@ class WorldModel(nn.Module):
             nn.Sequential(nn.LayerNorm(hidden), nn.Linear(hidden, hidden), nn.SiLU(), nn.Linear(hidden, hidden))
             for _ in range(layers)
         ])
-        self.out = nn.Linear(hidden, S.N_CONT + S.N_BIN)
+        self.out = nn.Linear(hidden, S.N_CONT + N_LOGITS)
         self.register_buffer("s_mean", torch.zeros(S.STATE_DIM) if s_mean is None else torch.as_tensor(s_mean, dtype=torch.float32))
         self.register_buffer("s_std", torch.ones(S.STATE_DIM) if s_std is None else torch.as_tensor(s_std, dtype=torch.float32))
         self.register_buffer("d_std", torch.ones(S.N_CONT) if d_std is None else torch.as_tensor(d_std, dtype=torch.float32))
@@ -49,7 +66,7 @@ class WorldModel(nn.Module):
 
     def forward(self, x: torch.Tensor):
         """x: the single model vector (B, MODEL_DIM) = [state | inputs].
-        Returns (normalised continuous deltas (B, N_CONT), binary logits (B, N_BIN))."""
+        Returns (normalised continuous deltas (B, N_CONT), event logits (B, N_LOGITS), see head layout)."""
         s, u = self.split(x)
         x = torch.cat([(s - self.s_mean) / self.s_std, u], dim=-1)
         h = torch.nn.functional.silu(self.inp(x))
@@ -57,6 +74,28 @@ class WorldModel(nn.Module):
             h = h + blk(h)
         y = self.out(h)
         return y[:, : S.N_CONT], y[:, S.N_CONT:]
+
+    @staticmethod
+    def events(s: torch.Tensor, logits: torch.Tensor):
+        """Derive the discrete part of the next state from the event logits (plain tensor ops, so the
+        same code exports to ONNX). Returns act_next (B, N_BUL), dir_next (B,), alive_next (B, N_INV),
+        all float 0/1, and the chosen hit index (B, N_BUL)."""
+        B = s.shape[0]
+        act_l = logits[:, HEAD_ACT:HEAD_ACT + N_BUL]
+        dir_l = logits[:, HEAD_DIR]
+        reset_l = logits[:, HEAD_RESET]
+        hit_l = logits[:, HEAD_HIT:].reshape(B, N_BUL, N_HIT)
+        cur_act = (s[:, BUL_ACT_T.to(s.device)] > 0.5).to(s.dtype)                    # only active bullets can hit
+        choice = torch.argmax(hit_l, dim=-1)                                            # (B, N_BUL)
+        onehot = (choice[:, :, None] == torch.arange(N_HIT, device=s.device)[None, None, :]).to(s.dtype)
+        is_hit = (1.0 - onehot[:, :, C.N_INVADERS]) * cur_act                           # (B, N_BUL)
+        killed = torch.amax(onehot[:, :, : C.N_INVADERS] * is_hit[:, :, None], dim=1)   # (B, N_INV)
+        alive = (s[:, S.INV_OFF:S.STATE_DIM] > 0.5).to(s.dtype)
+        reset = (reset_l > 0).to(s.dtype)[:, None]
+        alive_next = reset + (1.0 - reset) * alive * (1.0 - killed)
+        act_next = (act_l > 0).to(s.dtype) * (1.0 - is_hit)                              # a hit consumes the bullet
+        dir_next = (dir_l > 0).to(s.dtype)
+        return act_next, dir_next, alive_next, choice
 
     @torch.no_grad()
     def predict(self, x: torch.Tensor) -> torch.Tensor:
@@ -68,12 +107,14 @@ class WorldModel(nn.Module):
     def predict_state(self, x: torch.Tensor) -> torch.Tensor:
         """Next world state (B, STATE_DIM) with manifold post-processing."""
         s, _ = self.split(x)
-        d, logit = self.forward(x)
+        d, logits = self.forward(x)
         nxt = s.clone()
         cont = s[:, CONT_IDX_T.to(s.device)] + d * self.d_std
         nxt[:, CONT_IDX_T.to(s.device)] = torch.minimum(torch.maximum(cont, self.cont_lo), self.cont_hi)
-        nxt[:, BIN_IDX_T.to(s.device)] = (logit > 0).to(s.dtype)
-        act = nxt[:, BUL_ACT_T.to(s.device)]                        # (B, 6)
+        act, dir_next, alive_next, _ = self.events(s, logits)
+        nxt[:, BUL_ACT_T.to(s.device)] = act
+        nxt[:, FORM_DIR_IDX] = dir_next
+        nxt[:, S.INV_OFF:S.STATE_DIM] = alive_next
         pos_idx = BUL_POS_T.to(s.device)
         nxt[:, pos_idx[:, 0]] = nxt[:, pos_idx[:, 0]] * act
         nxt[:, pos_idx[:, 1]] = nxt[:, pos_idx[:, 1]] * act
@@ -82,11 +123,13 @@ class WorldModel(nn.Module):
 
 def save_checkpoint(model: WorldModel, path: str | Path, extra: dict | None = None) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"hidden": model.hidden, "layers": model.layers, "state_dict": model.state_dict(), "extra": extra or {}}, path)
+    torch.save({"version": MODEL_VERSION, "hidden": model.hidden, "layers": model.layers, "state_dict": model.state_dict(), "extra": extra or {}}, path)
 
 
 def load_model(path: str | Path, device: str = "cpu") -> WorldModel:
     ck = torch.load(path, map_location="cpu")
+    if ck.get("version", 1) != MODEL_VERSION:
+        raise RuntimeError(f"{path}: world model version {ck.get('version', 1)}, this code needs {MODEL_VERSION} (structured event head); retrain with python -m nge.train")
     m = WorldModel(ck["hidden"], ck["layers"])
     m.load_state_dict(ck["state_dict"])
     return m.to(device).eval()

@@ -79,10 +79,29 @@ rows hash `edadd50658a76fda`. `--sim det` is now the default; `--sim onnx` keeps
 * Publishing: MIT `LICENSE` (copyright holder written as "lpall": the user may want their
   full name), `THIRD_PARTY_NOTICES.md`, pyproject licence metadata. No remote configured yet.
 
+## Rules: measurement, structured events, closed-loop fine-tuning (2026-10-12, done)
+
+* `nge/rules.py`: 10 rules checked on closed-loop rollouts; classic sim scores 0 (after fixing
+  the checks for same-slot respawn, cooldown decay order, spawn position vs moved ship, wall
+  contact). Two rules carry gameplay tolerances (|v| < 0.02 is "stopped", cooldown jump > 0.05).
+* World model v2 (`MODEL_VERSION = 2`): event head = act[6] | dir | reset | hit[6 x 19]; alive'
+  derived (`WorldModel.events`), mirrored in the ONNX graph (ArgMax/Equal/ReduceMax) and in
+  `det_sim.cpp::finish`. `.nge` format v2. `nge_test` allows <= 0.5 % det-vs-ORT rows to differ
+  (argmax near-ties); det-vs-det stays bit-exact (verified CPU == CUDA again).
+* Training targets: `sim.step_events` / `data.generate(events=True)` give per-bullet hit index
+  and wave reset.
+* `nge/finetune.py`: on-policy rollouts + teacher one-step targets; best round by violation
+  index (ratios floored at +5/1000). Lessons: hit-weight 8 during fine-tuning triples ghost
+  kills in one round; lr 2e-4 constant destroys fidelity; the working recipe is lr 2e-5 cosine,
+  hit-weight 1, teacher ratio 5. Gains are real but partial (see README table); spawn
+  placement and cooldown precision regress a little.
+* Checkpoints: `world_model.pt` = v2+ft (shipped), `world_model_v2_pre.pt` (v2 before ft),
+  `world_model_v1.pt` (old head) kept locally, gitignored.
+* Ideas not done: structural spawn head (per player: which free slot to fire into, gated by
+  fire & cooldown), which would attack the largest remaining rate (spawn without fire 75/1000);
+  a rule-violation penalty inside the fine-tuning loss (differentiable surrogates).
+
 ## Parked
 
-* World-model artifact: one bullet occasionally kills 3 invaders (flag-transition accuracy
-  ~92 %). Levers: more samples around hit events, a loss term penalising >1 kill per bullet,
-  closed-loop fine-tuning on the model's own rollouts.
 * Client: no error threshold before replay; no jitter buffer / interpolation for the remote
   ship.

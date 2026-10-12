@@ -118,6 +118,53 @@ The rest is where the neural world visibly differs from the hand-written one: an
 bullet that passes through an invader, or a kill that happens a tick early. That is part of
 what the architecture has to live with, and the client HUD shows the resulting drift.
 
+## Rules: measured, then built in
+
+`python -m nge.rules` rolls a world model out closed loop (its own outputs fed back, the
+training input policies) and counts how often a transition breaks a rule the teacher obeys by
+construction: more invaders dying than bullets consumed, an invader dying with no bullet in
+its box, a bullet vanishing on screen, resurrections outside a wave reset, bullets spawning
+without fire or away from the ship, ships interpenetrating or touching without stopping,
+cooldown jumps, bullets drifting sideways. Rates are per 1000 ticks or per 1000 events; the
+classic sim scores 0 on every rule. This is the number that says whether the learned rules are
+*right*, which open-loop drift against the teacher does not.
+
+The discrete events are not left to independent per-flag sigmoids. The world model's head
+(`nge/model.py`, `WorldModel.events`) outputs, per bullet, a choice over "which invader did I
+hit, or none", plus active / direction / wave-reset logits, and the next alive flags are
+*derived*: `alive' = reset ? 1 : alive & ~killed`, a hit consumes its bullet. One bullet, one
+kill, by construction; the derivation is plain tensor ops, so it lives inside the ONNX graph
+and is mirrored in the deterministic C++ post-processing. Closed-loop fine-tuning
+(`python -m nge.finetune`) then trains the model on the states it actually visits, with the
+teacher's one-step answer at those states, keeping the checkpoint with the lowest violation
+index.
+
+Closed loop, 512 worlds x 600 ticks, violations per 1000 ticks (or per 1000 kills / spawns /
+bullet-ticks where noted). v1 = independent flag sigmoids; v2 = structured event head; v2+ft =
+v2 after closed-loop fine-tuning (4 rounds, best round kept), the shipped model.
+
+| rule | v1 | v2 | v2+ft |
+|---|---|---|---|
+| multi-kill (ticks with more kills than bullets consumed) | 3.42 | **0** | **0** |
+| ghost kill (per 1000 kills) | 73.6 | 9.3 | **8.5** |
+| bullet vanishes on screen (per 1000 bullet-ticks) | 3.66 | **1.60** | 1.85 |
+| resurrection outside a wave reset | 1.48 | **0.51** | 1.33 |
+| spawn without fire (per 1000 spawns) | 138.5 | 141.8 | **75.3** |
+| spawn > 0.02 from the ship (per 1000 spawns) | **74.7** | 100.4 | 135.4 |
+| ships interpenetrating > 0.005 | 17.3 | 58.4 | **9.6** |
+| ships touching but not stopped | **6.9** | 21.4 | 12.4 |
+| cooldown jump > 0.05 without a spawn | 2.41 | **2.18** | 8.12 |
+| bullet drift (per 1000 bullet-ticks) | **15.7** | 19.2 | 20.6 |
+
+Open-loop drift against the teacher is unchanged by the head (ship position error 0.00015 per
+teacher-forced step, 0.09 after 300 ticks). What the table says: the structured head removes
+multi-kills by construction and cuts ghost kills eightfold; fine-tuning on the model's own
+rollouts halves spawns-without-fire and interpenetration but costs some spawn placement and
+cooldown precision. Fine-tuning turned out to be delicate: with the hit-class weight used for
+training from scratch (8x) it raised ghost kills threefold within one round; the shipped recipe
+uses a neutral weight, a 5:1 teacher-to-on-policy mix, a 2e-5 peak rate with cosine decay per
+round, and keeps the round with the lowest violation index (`--rounds 4`, index 0.945).
+
 ## Neural renderer
 
 `nge/renderer.py` maps the 49-float state to a 720x720 RGB frame. Each pixel receives the
@@ -291,6 +338,17 @@ platform-independent input sequence, hashes every intermediate state and compare
 `det(cpu)` over the 2048 test vectors. Compare the printed hashes between machines. The renderer
 does not need any of this: pixels never feed back into the state.
 
+## Performance: one GPU, several processes
+
+Each client renders a 720x720 frame per tick, about 17 ms on an RTX 4090, so two clients plus
+the server on one GPU exceed the 33 ms tick. The client never lets rendering delay the
+simulation: when it is behind schedule it runs the missed ticks first and skips the neural
+render for that iteration (the previous frame stays on screen), so its inputs keep reaching
+the server on time. `--log-every 2` prints the loop, simulation and render times plus the
+number of skipped renders and catch-up ticks. For a shared-GPU test, give one or both clients
+the lighter renderer: `--renderer checkpoints/renderer_480.onnx` (same weights exported at
+480x480, about 8 ms). In the intended deployment each client has its own GPU.
+
 ## What to look at while playing
 
 The HUD reports: how many ticks the client runs ahead, the input slack the server sees, ticks
@@ -345,8 +403,6 @@ design of the deterministic world-model kernel.
 * Renderer: fp16 export for the 720 renderer if the budget gets tight; a 16:9 window with the
   HUD beside the square world; explosions / trails (the renderer would need the previous
   frame or a state extension); a diffusion/latent decoder once the state becomes a latent.
-* World model: one bullet occasionally kills more than one invader (flag-transition accuracy
-  ~92%); more samples around hit events or a one-kill-per-bullet loss term.
 * Train on the model's own rollouts (closed-loop fine-tuning) to shrink long-horizon drift.
 * Sequence or latent state instead of a hand-designed vector, so the "game design" lives in
   the data rather than in `state.py`.

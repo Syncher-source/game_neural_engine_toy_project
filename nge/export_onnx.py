@@ -26,7 +26,7 @@ import torch.nn as nn
 from . import config as C
 from . import sim
 from . import state as S
-from .model import load_model
+from .model import load_model, WorldModel, N_BUL, FORM_DIR_IDX
 
 
 class ExportModel(nn.Module):
@@ -35,26 +35,26 @@ class ExportModel(nn.Module):
         self.m = m
         P_cont = torch.zeros(S.N_CONT, S.STATE_DIM)
         P_cont[torch.arange(S.N_CONT), torch.as_tensor(S.CONT_IDX)] = 1.0
-        P_bin = torch.zeros(S.N_BIN, S.STATE_DIM)
-        P_bin[torch.arange(S.N_BIN), torch.as_tensor(S.BIN_IDX)] = 1.0
+        P_act = torch.zeros(N_BUL, S.STATE_DIM); P_act[torch.arange(N_BUL), torch.as_tensor(S.BUL_ACT_IDX)] = 1.0
+        P_dir = torch.zeros(1, S.STATE_DIM); P_dir[0, FORM_DIR_IDX] = 1.0
+        P_inv = torch.zeros(C.N_INVADERS, S.STATE_DIM); P_inv[torch.arange(C.N_INVADERS), S.INV_OFF + torch.arange(C.N_INVADERS)] = 1.0
         lo = torch.full((S.STATE_DIM,), -1e9); hi = torch.full((S.STATE_DIM,), 1e9)
         lo[S.CONT_IDX] = torch.as_tensor(S.CONT_LO[S.CONT_IDX]); hi[S.CONT_IDX] = torch.as_tensor(S.CONT_HI[S.CONT_IDX])
         M_bul = torch.zeros(C.N_PLAYERS * C.N_BULLETS, S.STATE_DIM)
         for b, (ix, iy) in enumerate(S.BUL_POS_IDX.reshape(-1, 2)):
             M_bul[b, int(ix)] = 1.0; M_bul[b, int(iy)] = 1.0
-        self.register_buffer("P_cont", P_cont); self.register_buffer("P_bin", P_bin)
+        self.register_buffer("P_cont", P_cont); self.register_buffer("P_act", P_act); self.register_buffer("P_dir", P_dir); self.register_buffer("P_inv", P_inv)
         self.register_buffer("lo", lo); self.register_buffer("hi", hi); self.register_buffer("M_bul", M_bul)
 
     def forward(self, x):
         """x: (B, MODEL_DIM) = [state | inputs] -> x_next (B, MODEL_DIM) = [next state | zeros].
         Same vector type in and out; the input slots come back consumed."""
         state = x[:, : S.STATE_DIM]
-        d, logit = self.m(x)
+        d, logits = self.m(x)
         cont_next = state @ self.P_cont.t() + d * self.m.d_std
-        bin_next = (logit > 0).to(state.dtype)
-        nxt = cont_next @ self.P_cont + bin_next @ self.P_bin
+        act, dir_next, alive_next, _ = WorldModel.events(state, logits)      # one bullet, one kill: inside the graph
+        nxt = cont_next @ self.P_cont + act @ self.P_act + dir_next[:, None] @ self.P_dir + alive_next @ self.P_inv
         nxt = torch.minimum(torch.maximum(nxt, self.lo), self.hi)
-        act = bin_next[:, : C.N_PLAYERS * C.N_BULLETS]        # BIN_IDX starts with the bullet flags
         keep = 1.0 - (1.0 - act) @ self.M_bul
         consumed = x[:, S.STATE_DIM:] * 0.0
         return torch.cat([nxt * keep, consumed], dim=1)

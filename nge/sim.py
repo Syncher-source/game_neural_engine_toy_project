@@ -20,6 +20,15 @@ def step(s: np.ndarray, u: np.ndarray) -> np.ndarray:
     u: (B, INPUT_DIM) float32, per player [ax, ay, fire]
     returns a new (B, STATE_DIM) array (the input is not modified).
     """
+    return step_events(s, u)[0]
+
+
+def step_events(s: np.ndarray, u: np.ndarray):
+    """Like `step`, also returning the discrete events of the tick as training targets for the
+    structured event heads of the world model:
+        hit    (B, N_PLAYERS*N_BULLETS) int: index of the invader the bullet hit, or N_INVADERS for none
+        reset  (B,) bool: the wave was cleared and respawned this tick
+    """
     s = np.array(s, dtype=np.float32, copy=True)
     B = s.shape[0]
     sh = S.ships(s)
@@ -83,6 +92,7 @@ def step(s: np.ndarray, u: np.ndarray) -> np.ndarray:
     hits = active[..., None] & alive & (np.abs(bx - ix) < C.INV_HALF_W) & (np.abs(by - iy) < C.INV_HALF_H)
     killed = hits.any(axis=(1, 2))                                 # (B, NI)
     bullet_hit = hits.any(axis=3)                                  # (B, P, NB)
+    hit_idx = np.where(bullet_hit, hits.argmax(axis=3), C.N_INVADERS).reshape(B, -1)   # invaders never overlap: <=1 per bullet
     inv[killed] = 0.0
     active &= ~bullet_hit
 
@@ -114,7 +124,7 @@ def step(s: np.ndarray, u: np.ndarray) -> np.ndarray:
     cleared = inv.sum(axis=1) == 0
     inv[cleared] = 1.0
     fo[cleared, 1] = 0.0
-    return s
+    return s, hit_idx.astype(np.int64), cleared
 
 
 class ClassicSim:

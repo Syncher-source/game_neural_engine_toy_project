@@ -1,6 +1,6 @@
 // Graphical client: SDL3 window + keyboard/gamepad, ClientCore for prediction/reconciliation,
 // the renderer network for every frame.
-//   nge_client --player 0 [--server host:port] [--sim det|onnx] [--model path] [--renderer path] [--cpu] [--no-interop]
+//   nge_client --player 0 [--server host:port] [--sim det|onnx] [--model path] [--renderer path] [--cpu] [--no-interop] [--log-every 2]
 //              [--bot chaser] [--loss .. --latency .. --jitter ..] [--lead N] [--no-smooth]
 // Only with -DNGE_WITH_CLASSIC_SIM=ON:    --classic (hand-written simulation)
 // Only with -DNGE_WITH_CLASSIC_RENDER=ON: --render classic, R key, G ghost overlay (vector drawing)
@@ -112,7 +112,19 @@ int main(int argc, char** argv) {
   Uint64 next = SDL_GetTicksNS();
   bool running = true;
   bool want_screenshot = false;
+  // Timing. The simulation tick must never wait for the renderer: when the loop is behind (a slow
+  // or shared GPU), extra simulation ticks run first and the neural render is skipped for that
+  // iteration (the previous frame stays on screen). Otherwise the client's inputs arrive late at
+  // the server, which then holds stale inputs: the ship barely moves and everything jitters.
+  const double log_every = a.getd("--log-every", 0.0);
+  double ema_sim = 0, ema_render = 0, ema_loop = 0;
+  uint64_t skipped_renders = 0, catchup_ticks = 0, n_loops = 0;
+  Uint64 last_log = SDL_GetTicksNS(), loop_start = SDL_GetTicksNS();
+  SDL_Texture* last_tex = nullptr;
+  auto ema = [](double& e, double v) { e = e == 0 ? v : e * 0.9 + v * 0.1; };
   while (running) {
+    const Uint64 loop_t0 = SDL_GetTicksNS();
+    ema(ema_loop, (loop_t0 - loop_start) / 1e6); loop_start = loop_t0; ++n_loops;
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
       if (ev.type == SDL_EVENT_QUIT) running = false;
@@ -145,7 +157,16 @@ int main(int argc, char** argv) {
             SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 8000) own[2] = 1.f;
       }
     }
-    core.frame(own);
+    {
+      const Uint64 t0 = SDL_GetTicksNS();
+      core.frame(own);
+      // behind schedule: run the missed ticks now (bounded), so the server keeps receiving inputs on time
+      int extra = 0;
+      while (SDL_GetTicksNS() >= next + tick_ns && extra < 4) { core.frame(own); next += tick_ns; ++extra; }
+      catchup_ticks += extra;
+      ema(ema_sim, (SDL_GetTicksNS() - t0) / 1e6);
+    }
+    const bool behind = SDL_GetTicksNS() >= next + tick_ns / 2;    // no time left in this tick for a 17 ms render
 
     // ---- render: the state (ships at their visually smoothed positions) goes to the renderer network
     SDL_SetRenderDrawColor(ren, 12, 12, 24, 255);
@@ -157,18 +178,25 @@ int main(int argc, char** argv) {
 #if NGE_WITH_CLASSIC_RENDER
     if (vector_mode) { neural_frame = false; classic_render::draw_world(ren, size, state_of(rs), spos); }
 #endif
+    bool rendered = false;
     if (neural_frame) {
       SDL_Texture* tex = nullptr;
-      if (interop) {
-        interop->begin_frame();
-        const void* dev = nrend->render_gpu(rs);
-        if (dev) { interop->submit(dev, (size_t)nrend->width() * 4); tex = interop->texture(); }
-      }
-      if (!tex) {
-        const auto& px = nrend->render(rs);
-        if (!frame_tex) { frame_tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING, nrend->width(), nrend->height()); SDL_SetTextureScaleMode(frame_tex, SDL_SCALEMODE_NEAREST); }
-        SDL_UpdateTexture(frame_tex, nullptr, px.data(), nrend->width() * 4);
-        tex = frame_tex;
+      if (behind && last_tex) { tex = last_tex; ++skipped_renders; }          // keep the previous frame, stay on schedule
+      else {
+        const Uint64 t0 = SDL_GetTicksNS();
+        if (interop) {
+          interop->begin_frame();
+          const void* dev = nrend->render_gpu(rs);
+          if (dev) { interop->submit(dev, (size_t)nrend->width() * 4); tex = interop->texture(); }
+        }
+        if (!tex) {
+          const auto& px = nrend->render(rs);
+          if (!frame_tex) { frame_tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING, nrend->width(), nrend->height()); SDL_SetTextureScaleMode(frame_tex, SDL_SCALEMODE_NEAREST); }
+          SDL_UpdateTexture(frame_tex, nullptr, px.data(), nrend->width() * 4);
+          tex = frame_tex;
+        }
+        ema(ema_render, (SDL_GetTicksNS() - t0) / 1e6);
+        rendered = true; last_tex = tex;
       }
       SDL_FRect dst{0, 0, (float)size, (float)size};
       SDL_RenderTexture(ren, tex, nullptr, &dst);
@@ -181,10 +209,10 @@ int main(int argc, char** argv) {
     float y = (float)size + 8;
     if (core.synced()) for (auto& l : core.hud()) { SDL_RenderDebugText(ren, 8, y, l.c_str()); y += 14; }
     else SDL_RenderDebugText(ren, 8, y, ("waiting for server " + srv).c_str());
-    char nb[220];
-    std::snprintf(nb, sizeof nb, "renderer: %s %.2f ms [%s]   netsim: loss %.0f%%  latency %.0fms  jitter %.0fms   keys: WASD/arrows, space, H smooth%s",
-                  neural_frame ? nrend->name() : "vector", neural_frame ? nrend->last_ms() : 0.0, neural_frame ? frame_path : "classic drawing",
-                  np.loss * 100, np.latency_ms, np.jitter_ms, NGE_WITH_CLASSIC_RENDER ? ", G ghost, R renderer" : "");
+    char nb[260];
+    std::snprintf(nb, sizeof nb, "renderer: %s %.1f ms [%s]   loop %.1f ms (sim %.1f)  skipped renders %llu  catch-up ticks %llu   netsim: loss %.0f%% latency %.0fms   keys: WASD/arrows, space, H smooth%s",
+                  neural_frame ? nrend->name() : "vector", ema_render, neural_frame ? frame_path : "classic drawing", ema_loop, ema_sim,
+                  (unsigned long long)skipped_renders, (unsigned long long)catchup_ticks, np.loss * 100, np.latency_ms, NGE_WITH_CLASSIC_RENDER ? ", G ghost, R renderer" : "");
     SDL_RenderDebugText(ren, 8, y, nb);
     if (want_screenshot) {
       want_screenshot = false;
@@ -200,7 +228,14 @@ int main(int argc, char** argv) {
       }
     }
     SDL_RenderPresent(ren);
-    if (interop && neural_frame) interop->end_frame();
+    if (interop && neural_frame && rendered) interop->end_frame();
+    if (log_every > 0 && (SDL_GetTicksNS() - last_log) / 1e9 >= log_every) {
+      last_log = SDL_GetTicksNS();
+      std::printf("[client] loop %.1f ms (sim %.1f, render %.1f)  skipped renders %llu  catch-up ticks %llu  |", ema_loop, ema_sim, ema_render,
+                  (unsigned long long)skipped_renders, (unsigned long long)catchup_ticks);
+      if (core.synced()) for (auto& l : core.hud()) std::printf(" %s |", l.c_str());
+      std::printf("\n"); std::fflush(stdout);
+    }
 
     next += tick_ns;
     const Uint64 now = SDL_GetTicksNS();

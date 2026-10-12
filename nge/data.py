@@ -47,10 +47,11 @@ class PolicyBank:
         return self.cur.reshape(B, S.INPUT_DIM).copy()
 
 
-def generate(n_samples: int, worlds: int = 4096, episode: int = 200, seed: int = 0, verbose: bool = True):
-    """Returns (states, inputs, next_states) float32 arrays with n_samples rows."""
+def generate(n_samples: int, worlds: int = 4096, episode: int = 200, seed: int = 0, verbose: bool = True, events: bool = False):
+    """Returns (states, inputs, next_states) float32 arrays with n_samples rows; with events=True
+    also (hit (n, N_PLAYERS*N_BULLETS) int64, reset (n,) bool), see sim.step_events."""
     rng = np.random.default_rng(seed)
-    out_s, out_u, out_n = [], [], []
+    out_s, out_u, out_n, out_h, out_r = [], [], [], [], []
     have = 0
     while have < n_samples:
         from_start = rng.random(worlds) < 0.3
@@ -59,8 +60,8 @@ def generate(n_samples: int, worlds: int = 4096, episode: int = 200, seed: int =
         pol = PolicyBank(worlds, rng)
         for _ in range(episode):
             u = pol.act(s)
-            n = sim.step(s, u)
-            out_s.append(s); out_u.append(u); out_n.append(n)
+            n, hit, reset = sim.step_events(s, u)
+            out_s.append(s); out_u.append(u); out_n.append(n); out_h.append(hit); out_r.append(reset)
             s = n
             have += worlds
             if have >= n_samples:
@@ -70,4 +71,6 @@ def generate(n_samples: int, worlds: int = 4096, episode: int = 200, seed: int =
     st = np.concatenate(out_s)[:n_samples]
     ut = np.concatenate(out_u)[:n_samples]
     nt = np.concatenate(out_n)[:n_samples]
+    if events:
+        return st, ut, nt, np.concatenate(out_h)[:n_samples], np.concatenate(out_r)[:n_samples]
     return st, ut, nt

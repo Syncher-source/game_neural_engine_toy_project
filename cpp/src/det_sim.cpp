@@ -35,7 +35,7 @@ namespace nge {
 
 namespace {
 
-struct Dims { int S, M, H, O, L; float eps; };
+struct Dims { int S, M, H, O, L; float eps; int n_bul, n_inv; };   // O = n_cont + n_logits
 
 // Same arithmetic as nge_det_linear: lane j computes output o+j with fmaf(w, x, acc) from the
 // bias in ascending k. Four vectors in flight hide the FMA latency.
@@ -94,12 +94,13 @@ struct DetSim::Impl {
   void load(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
     if (!f) throw std::runtime_error("cannot open " + path);
-    char magic[4]; uint32_t version; int dims[6]; float eps;
+    char magic[4]; uint32_t version; int dims[8]; float eps;
     f.read(magic, 4); f.read((char*)&version, 4); f.read((char*)dims, sizeof dims); f.read((char*)&eps, 4);
-    if (!f || std::memcmp(magic, "NGEW", 4) != 0 || version != 1) throw std::runtime_error(path + ": not a NGEW v1 weights file");
-    d = {dims[1], dims[0], dims[2], dims[4] + dims[5], dims[3], eps};
-    if (d.S != L::STATE_DIM || d.M != L::MODEL_DIM || dims[4] != L::N_CONT || dims[5] != L::N_BIN)
-      throw std::runtime_error(path + ": dimensions do not match layout.h (re-run python -m nge.export_onnx)");
+    if (!f || std::memcmp(magic, "NGEW", 4) != 0 || version != 2) throw std::runtime_error(path + ": not a NGEW v2 weights file (re-run python -m nge.export_onnx)");
+    d = {dims[1], dims[0], dims[2], dims[4] + dims[5], dims[3], eps, dims[6], dims[7]};
+    if (d.S != L::STATE_DIM || d.M != L::MODEL_DIM || dims[4] != L::N_CONT || d.n_bul != L::N_PLAYERS * L::N_BULLETS || d.n_inv != L::N_INVADERS ||
+        dims[5] != d.n_bul + 2 + d.n_bul * (d.n_inv + 1))
+      throw std::runtime_error(path + ": dimensions do not match layout.h / the event head layout (re-run python -m nge.export_onnx)");
     if (d.H % 32 != 0 || d.H > 1024) throw std::runtime_error(path + ": hidden size must be a multiple of 32 and <= 1024");
     blob.assign(NGE_DET_BLOB_SIZE(d.S, d.M, d.H, d.O, d.L) + 3 * L::N_CONT, 0.0f);
     auto rd = [&](float* dst, size_t n) { f.read((char*)dst, n * 4); if (!f) throw std::runtime_error(path + ": truncated"); };
@@ -219,17 +220,39 @@ struct DetSim::Impl {
     d_w = d_x = d_y = 0; mod = nullptr; ctx = nullptr;
   }
 
-  // ---- post-processing (host, shared by all backends): threshold, clamp, zero inactive bullets, consume inputs
+  // ---- post-processing (host, shared by all backends), mirrors WorldModel.events() in model.py:
+  // clamp the continuous part; per bullet, argmax over "which invader did I hit / none" (first
+  // maximum on ties, like torch.argmax and ONNX ArgMax); alive' = reset ? 1 : alive & ~killed;
+  // a hit consumes its bullet; inactive bullets are zeroed; inputs come back consumed.
   ModelVector finish(const ModelVector& x) const {
     ModelVector out{};
     State& n = state_of(out);
-    n = state_of(x);
+    const State& s = state_of(x);
+    n = s;
     for (int j = 0; j < L::N_CONT; ++j) {
       const int idx = L::CONT_IDX[j];
       const float v = fmaf(y[j], d_std()[j], n[idx]);
       n[idx] = v < cont_lo()[j] ? cont_lo()[j] : (v > cont_hi()[j] ? cont_hi()[j] : v);
     }
-    for (int j = 0; j < L::N_BIN; ++j) n[L::BIN_IDX[j]] = y[L::N_CONT + j] > 0.0f ? 1.0f : 0.0f;
+    const float* lg = y.data() + L::N_CONT;
+    const float* act_l = lg;
+    const float dir_l = lg[d.n_bul];
+    const float reset_l = lg[d.n_bul + 1];
+    const float* hit_l = lg + d.n_bul + 2;
+    const int n_hit = d.n_inv + 1;
+    bool killed[L::N_INVADERS] = {};
+    for (int b = 0; b < d.n_bul; ++b) {
+      const int p = b / L::N_BULLETS, k = b % L::N_BULLETS;
+      const bool cur_act = bullet(s, p, k, 2) > 0.5f;
+      int choice = 0;
+      for (int i = 1; i < n_hit; ++i) if (hit_l[b * n_hit + i] > hit_l[b * n_hit + choice]) choice = i;
+      const bool hit = cur_act && choice < d.n_inv;
+      if (hit) killed[choice] = true;
+      bullet(n, p, k, 2) = (act_l[b] > 0.0f && !hit) ? 1.0f : 0.0f;
+    }
+    const bool reset = reset_l > 0.0f;
+    for (int i = 0; i < L::N_INVADERS; ++i) inv(n, i) = reset ? 1.0f : ((inv(s, i) > 0.5f && !killed[i]) ? 1.0f : 0.0f);
+    form(n, 2) = dir_l > 0.0f ? 1.0f : 0.0f;
     for (int p = 0; p < L::N_PLAYERS; ++p)
       for (int b = 0; b < L::N_BULLETS; ++b)
         if (bullet(n, p, b, 2) == 0.0f) { bullet(n, p, b, 0) = 0.0f; bullet(n, p, b, 1) = 0.0f; }

@@ -19,6 +19,7 @@ checkpoints/*
 !checkpoints/world_model.nge
 !checkpoints/renderer.pt
 !checkpoints/renderer.onnx
+!checkpoints/renderer_480.onnx
 
 # ---- logs, scratch, OS noise
 *.log

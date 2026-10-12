@@ -4,7 +4,8 @@ Plain little-endian file, fp32 arrays in a fixed order; no framework on the cons
 The C++ side transposes the matrices on load for the GPU/SIMD layout; the accumulation order
 (over the input index, ascending, starting from the bias) is fixed in `det_math.h`.
 
-    header: "NGEW", u32 version=1, i32 model_dim, state_dim, hidden, layers, n_cont, n_bin, f32 ln_eps
+    header: "NGEW", u32 version=2, i32 model_dim, state_dim, hidden, layers, n_cont, n_logits, n_bul, n_inv, f32 ln_eps
+    (n_logits = n_bul + 2 + n_bul * (n_inv + 1): act[n_bul] | dir | reset | hit[n_bul, n_inv + 1], see model.py)
     arrays: s_mean[state_dim], s_std[state_dim],
             inp_w[hidden, model_dim], inp_b[hidden],
             per layer: ln_w[hidden], ln_b[hidden], w1[hidden, hidden], b1[hidden], w2[hidden, hidden], b2[hidden],
@@ -19,23 +20,24 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from . import config as C
 from . import state as S
-from .model import WorldModel, load_model
+from .model import WorldModel, load_model, N_LOGITS, N_BUL
 
 MAGIC = b"NGEW"
-VERSION = 1
+VERSION = 2
 
 
 def export_det(model: WorldModel, path: str | Path) -> int:
     sd = {k: v.detach().cpu().contiguous().numpy().astype("<f4") for k, v in model.state_dict().items()}
     eps = float(model.blocks[0][0].eps)
-    out = [struct.pack("<4sIiiiiiif", MAGIC, VERSION, S.MODEL_DIM, S.STATE_DIM, model.hidden, model.layers, S.N_CONT, S.N_BIN, eps)]
+    out = [struct.pack("<4sIiiiiiiiif", MAGIC, VERSION, S.MODEL_DIM, S.STATE_DIM, model.hidden, model.layers, S.N_CONT, N_LOGITS, N_BUL, C.N_INVADERS, eps)]
     arrays = [sd["s_mean"], sd["s_std"], sd["inp.weight"], sd["inp.bias"]]
     for i in range(model.layers):
         arrays += [sd[f"blocks.{i}.0.weight"], sd[f"blocks.{i}.0.bias"], sd[f"blocks.{i}.1.weight"], sd[f"blocks.{i}.1.bias"],
                    sd[f"blocks.{i}.3.weight"], sd[f"blocks.{i}.3.bias"]]
     arrays += [sd["out.weight"], sd["out.bias"], sd["d_std"], sd["cont_lo"], sd["cont_hi"]]
-    assert sd["inp.weight"].shape == (model.hidden, S.MODEL_DIM) and sd["out.weight"].shape == (S.N_CONT + S.N_BIN, model.hidden)
+    assert sd["inp.weight"].shape == (model.hidden, S.MODEL_DIM) and sd["out.weight"].shape == (S.N_CONT + N_LOGITS, model.hidden)
     out += [np.ascontiguousarray(a).tobytes() for a in arrays]
     data = b"".join(out)
     Path(path).write_bytes(data)
